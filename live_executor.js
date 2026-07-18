@@ -44,6 +44,12 @@ const settings = {
     htf_filter_period: 160  
 };
 
+const riskSettings = {
+    atrStopMultiplier: 2.0,
+    atrTargetMultiplier: 2.0,
+    forwardHorizonCandles: 12
+};
+
 const calculateEMAArray = (data, period) => {
     if (data.length < period) return [];
     const k = 2 / (period + 1);
@@ -86,11 +92,71 @@ async function transmitTelemetry(score, action, msg) {
     if (error) logCyan(`telemetry transmission failed: ${error.message}`);
 }
 
+async function manageOpenPositions(currentHigh, currentLow, currentClose) {
+    try {
+        // pull down any open positions for this specific deployment profile
+        const { data: openPositions, error } = await supabase
+            .from('neptune_positions')
+            .select('*')
+            .eq('status', 'open')
+            .eq('mode', PAPER_TRADING ? 'paper' : 'live');
+
+        if (error) throw error;
+        if (!openPositions || openPositions.length === 0) return;
+
+        for (const pos of openPositions) {
+            const nextCandleCount = pos.candles_held + 1;
+            let activeStopFloor = parseFloat(pos.stop_loss);
+            let exitReason = null;
+            let finalPrice = currentClose;
+
+            // 🛡️ DYNAMIC BREAKEVEN SHIELD SYNCED FROM BACKTESTER
+            if (nextCandleCount >= 5) {
+                activeStopFloor = parseFloat(pos.entry_price);
+            }
+
+            // evaluate state conditions against current candle limits
+            if (currentLow <= activeStopFloor) {
+                exitReason = nextCandleCount >= 5 ? 'breakeven' : 'loss';
+                finalPrice = activeStopFloor;
+            } else if (currentHigh >= parseFloat(pos.take_profit)) {
+                exitReason = 'win';
+                finalPrice = parseFloat(pos.take_profit);
+            } else if (nextCandleCount >= riskSettings.forwardHorizonCandles) {
+                exitReason = 'timeout';
+                finalPrice = currentClose;
+            }
+
+            if (exitReason) {
+                const profitPct = ((finalPrice - parseFloat(pos.entry_price)) / parseFloat(pos.entry_price)) * 100;
+                
+                // update position archive status
+                await supabase
+                    .from('neptune_positions')
+                    .update({ status: exitReason, candles_held: nextCandleCount })
+                    .eq('id', pos.id);
+
+                // pass clean telemetry down to metrics interface
+                const logMsg = `position closed via ${exitReason} at ${finalPrice}. estimated lifecycle return: ${profitPct.toFixed(2)}%`;
+                logCyan(`>>> ${logMsg}`);
+                await transmitTelemetry(0, exitReason, logMsg);
+            } else {
+                // update candle iteration baseline
+                await supabase
+                    .from('neptune_positions')
+                    .update({ candles_held: nextCandleCount })
+                    .eq('id', pos.id);
+            }
+        }
+    } catch (err) {
+        logCyan(`error running portfolio state manager: ${err.message}`);
+    }
+}
+
 async function runExecutionCycle(session) {
     try {
         logCyan(`\n[${new Date().toISOString()}] fetching latest ${TIMEFRAME} market data for ${TICKER}...`);
         
-        // Fetch 300 candles to satisfy the 260 minimum history requirement (200 macro EMA + 60 lookback)
         const candles = await exchange.fetchOHLCV(TICKER, TIMEFRAME, undefined, 300);
         const minHistoryRequired = Math.max(settings.macro_ema_slow, settings.htf_filter_period) + 60;
         
@@ -113,6 +179,9 @@ async function runExecutionCycle(session) {
         const currentOpen = opens[idx];
         const currentHigh = highs[idx];
         const currentLow = lows[idx];
+
+        // --- MANAGE CURRENT OPEN EXPOSURES BEFORE NEW INFERENCE ---
+        await manageOpenPositions(currentHigh, currentLow, currentClose);
 
         // --- FEATURE EXTRACTION ---
         const date = new Date(timestamp);
@@ -267,10 +336,27 @@ async function runExecutionCycle(session) {
         logCyan(`alpha inference score: ${rawModelScore.toFixed(4)}`);
 
         if (rawModelScore >= VETO_THRESHOLD) {
+            const targetStopLoss = currentClose - (rawATR * riskSettings.atrStopMultiplier);
+            const targetTakeProfit = currentClose + (rawATR * riskSettings.atrTargetMultiplier);
+
             const msg = `high conviction setup detected. initiating bracket orders at ${currentClose}.`;
             logCyan(`>>> ${msg}`);
             await transmitTelemetry(rawModelScore, 'execute', msg);
             
+            // log the position initialization into our supabase state engine
+            const { error: posError } = await supabase.from('neptune_positions').insert([{
+                ticker: TICKER,
+                entry_price: currentClose,
+                stop_loss: targetStopLoss,
+                take_profit: targetTakeProfit,
+                status: 'open',
+                candles_held: 0,
+                raw_atr: rawATR,
+                mode: PAPER_TRADING ? 'paper' : 'live'
+            }]);
+
+            if (posError) logCyan(`failed to write state instance to database: ${posError.message}`);
+
             if (!PAPER_TRADING) {
                 // execute ccxt live market orders here
             }
@@ -292,7 +378,6 @@ async function bootNeptune() {
     logCyan('=================================================');
     
     try {
-        // Load the actual ONNX session
         const session = await ort.InferenceSession.create(MODEL_FILENAME);
         
         await runExecutionCycle(session);
