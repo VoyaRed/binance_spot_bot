@@ -6,6 +6,7 @@
     "start": "node live_executor.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
     "ccxt": "^4.0.0",
     "dotenv": "^16.0.0",
     "onnxruntime-node": "^1.14.0"
