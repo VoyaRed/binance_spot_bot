@@ -1,0 +1,13 @@
+{
+  "name": "project-neptune",
+  "version": "1.0.0",
+  "main": "live_executor.js",
+  "scripts": {
+    "start": "node live_executor.js"
+  },
+  "dependencies": {
+    "ccxt": "^4.0.0",
+    "dotenv": "^16.0.0",
+    "onnxruntime-node": "^1.14.0"
+  }
+}
