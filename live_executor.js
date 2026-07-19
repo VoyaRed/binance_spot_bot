@@ -34,7 +34,7 @@ const logCyan = (msg) => console.log(`\x1b[36m${msg.toLowerCase()}\x1b[0m`);
 const FLEET = [
     { ticker: 'ETH/USDT', modelFile: 'veto_engine_spot_15m_eth.onnx', threshold: 0.4807 },
     { ticker: 'BTC/USDT', modelFile: 'veto_engine_spot_15m_btc.onnx', threshold: 0.4735 }, 
-    { ticker: 'DOGE/USDT', modelFile: 'veto_engine_spot_15m_doge.onnx', threshold: 0.4800 } // Update after training
+    { ticker: 'DOGE/USDT', modelFile: 'veto_engine_spot_15m_doge.onnx', threshold: 0.4864 } // 🟢 FIXED: Updated to production holdout threshold 0.4864
 ];
 
 // --- SYNCHRONIZED MATH CLOSURES ---
@@ -94,10 +94,11 @@ async function manageOpenPositions() {
             .eq('mode', PAPER_TRADING ? 'paper' : 'live');
 
         if (error) throw error;
-        if (!openPositions || openPositions.length === 0) return;
+        if (!openPositions || openPositions.length === 0) return 0;
+
+        let activeCount = openPositions.length;
 
         for (const pos of openPositions) {
-            // Fetch latest candle strictly for the open position's ticker
             const latestCandles = await exchange.fetchOHLCV(pos.ticker, TIMEFRAME, undefined, 2);
             if (!latestCandles || latestCandles.length < 2) continue;
             
@@ -111,7 +112,6 @@ async function manageOpenPositions() {
             let exitReason = null;
             let finalPrice = currentClose;
 
-            // 🛡️ DYNAMIC BREAKEVEN SHIELD
             if (nextCandleCount >= 5) activeStopFloor = parseFloat(pos.entry_price);
 
             if (currentLow <= activeStopFloor) {
@@ -131,12 +131,15 @@ async function manageOpenPositions() {
                 const logMsg = `position closed via ${exitReason} at ${finalPrice}. return: ${profitPct.toFixed(2)}%`;
                 logCyan(`>>> [${pos.ticker}] ${logMsg}`);
                 await transmitTelemetry(pos.ticker, 0, exitReason, logMsg);
+                activeCount--;
             } else {
                 await supabase.from('neptune_positions').update({ candles_held: nextCandleCount }).eq('id', pos.id);
             }
         }
+        return activeCount; // 🟢 RETURN CURRENT ACTIVE COUNT FOR EXECUTION BLOCKING
     } catch (err) {
         logCyan(`error running portfolio state manager: ${err.message}`);
+        throw err; // Force execution crash to prevent phantom overlapping trades on error
     }
 }
 
@@ -232,7 +235,7 @@ async function extractFeaturesAndScore(botConfig, session) {
     const macroEmaSlow = calculateEMAArray(closeSliceRSI, settings.macro_ema_slow).pop();
     const dist_from_macro_fast = (currentClose - macroEmaFast) / macroEmaFast;
     
-    if (dist_from_macro_fast > 0.025) return null; // Macro extension veto
+    if (dist_from_macro_fast > 0.025) return null; 
 
     const dist_from_macro_slow = (currentClose - macroEmaSlow) / macroEmaSlow;
     let market_regime = (currentClose > macroEmaFast && macroEmaFast > macroEmaSlow) ? 1 : ((currentClose < macroEmaFast && macroEmaFast < macroEmaSlow) ? -1 : 0);
@@ -270,18 +273,24 @@ async function runExecutionCycle(sessions) {
     try {
         logCyan(`\n[${new Date().toISOString()}] executing multi-pair market scan...`);
         
-        // 1. Manage portfolio globally
-        await manageOpenPositions();
+        // 1. Manage portfolio globally and extract current active trade count
+        const openCount = await manageOpenPositions();
+        
+        // 🛡️ STRICT CONCURRENCY BLOCK: Exit immediately if a position is already running
+        if (openCount >= 1) {
+            logCyan(`active position detected (${openCount}/1). skipping scan to enforce strict 1 concurrent max constraint.`);
+            return;
+        }
 
-        // 2. Extract features and infer scores concurrently for the fleet
+        // 2. Extract features and infer scores concurrently across the network fleet
         const scanPromises = FLEET.map(bot => extractFeaturesAndScore(bot, sessions[bot.ticker]));
         const results = await Promise.all(scanPromises);
         
         let validSignals = [];
 
-        // 3. Filter valid results and build the queue
+        // 3. Filter valid results and build queue
         for (const res of results) {
-            if (!res) continue; // Vetoed by hard shields
+            if (!res) continue; 
             logCyan(`[${res.ticker}] alpha inference score: ${res.score.toFixed(4)}`);
             
             if (res.score >= res.threshold) {
@@ -289,7 +298,7 @@ async function runExecutionCycle(sessions) {
             }
         }
 
-        // 4. Resolve FCFS Concurrency (Choose Highest Conviction)
+        // 4. Resolve FCFS Concurrency (Choose Highest Conviction from this candle bar)
         if (validSignals.length > 0) {
             validSignals.sort((a, b) => b.score - a.score);
             const winner = validSignals[0]; 
@@ -297,7 +306,7 @@ async function runExecutionCycle(sessions) {
             const targetStopLoss = winner.currentClose - (winner.rawATR * riskSettings.atrStopMultiplier);
             const targetTakeProfit = winner.currentClose + (winner.rawATR * riskSettings.atrTargetMultiplier);
 
-            const msg = `highest conviction multi-pair setup detected on ${winner.ticker} (score: ${winner.score.toFixed(4)}). allocating 33% capital slice and initiating bracket orders.`;
+            const msg = `highest conviction multi-pair setup detected on ${winner.ticker} (score: ${winner.score.toFixed(4)}). allocating 100% capital slice and initiating bracket orders.`;
             logCyan(`>>> ${msg}`);
             await transmitTelemetry(winner.ticker, winner.score, 'execute', msg);
             
@@ -315,7 +324,7 @@ async function runExecutionCycle(sessions) {
             if (posError) logCyan(`failed to write state instance: ${posError.message}`);
 
             if (!PAPER_TRADING) {
-                // execute ccxt live market orders using 33% sizing calculation here
+                // execute ccxt live market orders using 100% sizing calculation here
             }
         } else {
             logCyan(`no inference scores crossed thresholds across fleet. holding flat.`);
