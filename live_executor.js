@@ -4,6 +4,7 @@ const http = require('http');
 const ccxt = require('ccxt');
 const ort = require('onnxruntime-node');
 const { createClient } = require('@supabase/supabase-js');
+const cron = require('node-cron');
 
 // --- render free tier dummy server ---
 const PORT = process.env.PORT || 3000;
@@ -47,7 +48,11 @@ const settings = {
 const riskSettings = {
     atrStopMultiplier: 2.0,
     atrTargetMultiplier: 2.0,
-    forwardHorizonCandles: 12
+    forwardHorizonCandles: 12,
+    // --- friction parameters for volatility filter ---
+    priceImpactPerc: 0.0002,    
+    takerFeePerc: 0.00019,      
+    minVolFeeMultiplier: 6.0    
 };
 
 const calculateEMAArray = (data, period) => {
@@ -94,7 +99,6 @@ async function transmitTelemetry(score, action, msg) {
 
 async function manageOpenPositions(currentHigh, currentLow, currentClose) {
     try {
-        // pull down any open positions for this specific deployment profile
         const { data: openPositions, error } = await supabase
             .from('neptune_positions')
             .select('*')
@@ -115,7 +119,6 @@ async function manageOpenPositions(currentHigh, currentLow, currentClose) {
                 activeStopFloor = parseFloat(pos.entry_price);
             }
 
-            // evaluate state conditions against current candle limits
             if (currentLow <= activeStopFloor) {
                 exitReason = nextCandleCount >= 5 ? 'breakeven' : 'loss';
                 finalPrice = activeStopFloor;
@@ -130,18 +133,15 @@ async function manageOpenPositions(currentHigh, currentLow, currentClose) {
             if (exitReason) {
                 const profitPct = ((finalPrice - parseFloat(pos.entry_price)) / parseFloat(pos.entry_price)) * 100;
                 
-                // update position archive status
                 await supabase
                     .from('neptune_positions')
                     .update({ status: exitReason, candles_held: nextCandleCount })
                     .eq('id', pos.id);
 
-                // pass clean telemetry down to metrics interface
                 const logMsg = `position closed via ${exitReason} at ${finalPrice}. estimated lifecycle return: ${profitPct.toFixed(2)}%`;
                 logCyan(`>>> ${logMsg}`);
                 await transmitTelemetry(0, exitReason, logMsg);
             } else {
-                // update candle iteration baseline
                 await supabase
                     .from('neptune_positions')
                     .update({ candles_held: nextCandleCount })
@@ -165,7 +165,8 @@ async function runExecutionCycle(session) {
             return;
         }
 
-        const idx = candles.length - 1;
+        // --- SHIFT INDEX TO TARGET LAST FULLY CLOSED CANDLE ---
+        const idx = candles.length - 2;
         const currentCandle = candles[idx];
         const timestamp = currentCandle[0];
 
@@ -190,35 +191,54 @@ async function runExecutionCycle(session) {
         const isNewYorkOpen = (hour >= 12 && hour <= 15) ? 1.0 : 0.0;
         const isAsianSqueeze = (hour >= 0 && hour <= 4) ? 1.0 : 0.0;
 
+        // 🛡️ SHIELD 1: ASIAN SESSION SQUEEZE DROP
+        if (isAsianSqueeze === 1.0) {
+            const shieldMsg = "shield active: skipping execution cycle during asian session squeeze.";
+            logCyan(shieldMsg);
+            await transmitTelemetry(0, 'shield_skip', shieldMsg);
+            return;
+        }
+
         const hour_sin = Math.sin(2 * Math.PI * hour / 24.0);
         const hour_cos = Math.cos(2 * Math.PI * hour / 24.0);
 
         let trSum14 = 0;
-        for (let j = closes.length - 14; j < closes.length; j++) {
+        for (let j = idx - 13; j <= idx; j++) {
             const highLow = highs[j] - lows[j];
-            const highClose = Math.abs(highs[j] - closes[j-1]);
-            const lowClose = Math.abs(lows[j] - closes[j-1]);
+            const highClose = Math.abs(highs[j] - (closes[j-1] || opens[j]));
+            const lowClose = Math.abs(lows[j] - (closes[j-1] || opens[j]));
             trSum14 += Math.max(highLow, highClose, lowClose);
         }
         const rawATR = trSum14 / 14; 
         
         let trSum7 = 0;
-        for (let j = closes.length - 7; j < closes.length; j++) {
+        for (let j = idx - 6; j <= idx; j++) {
             const highLow = highs[j] - lows[j];
-            const highClose = Math.abs(highs[j] - closes[j-1]);
-            const lowClose = Math.abs(lows[j] - closes[j-1]);
+            const highClose = Math.abs(highs[j] - (closes[j-1] || opens[j]));
+            const lowClose = Math.abs(lows[j] - (closes[j-1] || opens[j]));
             trSum7 += Math.max(highLow, highClose, lowClose);
         }
         const shortATR = trSum7 / 7;
         const atr_squeeze_ratio = shortATR / rawATR; 
         const atr_percentage = (rawATR / currentClose) * 100;
 
-        const volSlice = volumes.slice(-60);
+        // 🛡️ SHIELD 2: DYNAMIC FEE-VOLATILITY DROP
+        const totalFriction = riskSettings.takerFeePerc + riskSettings.priceImpactPerc;
+        const decimalATR = rawATR / currentClose;
+
+        if (decimalATR < (totalFriction * riskSettings.minVolFeeMultiplier)) {
+            const shieldMsg = `shield active: low volatility fee trap detected. atr decimal (${decimalATR.toFixed(6)}) is below friction threshold.`;
+            logCyan(shieldMsg);
+            await transmitTelemetry(0, 'shield_skip', shieldMsg);
+            return;
+        }
+
+        const volSlice = volumes.slice(idx - 59, idx + 1);
         const volMean = volSlice.reduce((a, b) => a + b, 0) / 60;
         const volStdDev = calcStdDev(volSlice, volMean);
         const vol_z_score = (volumes[idx] - volMean) / volStdDev; 
 
-        const volSMA20 = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+        const volSMA20 = volumes.slice(idx - 19, idx + 1).reduce((a, b) => a + b, 0) / 20;
         const rvol = volumes[idx] / (volSMA20 || 1);
 
         const candleRange = Math.max(currentHigh - currentLow, 0.00001);
@@ -240,12 +260,13 @@ async function runExecutionCycle(session) {
         const rangeStd20 = calcStdDev(ranges20, rangeMean20);
         const volatility_z_score = (candleRange - rangeMean20) / rangeStd20;
 
-        const rsi_14 = calculateRSI(closes, 14);
-        const pastRsi = calculateRSI(closes.slice(0, closes.length - 3), 14);
+        const closeSliceRSI = closes.slice(0, idx + 1);
+        const rsi_14 = calculateRSI(closeSliceRSI, 14);
+        const pastRsi = calculateRSI(closeSliceRSI.slice(0, closeSliceRSI.length - 3), 14);
         const rsi_slope = (rsi_14 - pastRsi) / 3;
 
-        const emaFast = calculateEMAArray(closes, settings.ema_fast_period).pop();
-        const emaSlow = calculateEMAArray(closes, settings.ema_slow_period).pop();
+        const emaFast = calculateEMAArray(closeSliceRSI, settings.ema_fast_period).pop();
+        const emaSlow = calculateEMAArray(closeSliceRSI, settings.ema_slow_period).pop();
         const ema_spread_ratio = (emaFast - emaSlow) / emaSlow;
 
         let bodySum5 = 0;
@@ -259,7 +280,7 @@ async function runExecutionCycle(session) {
         const momentum_3_period = (currentClose - closes[idx - 3]) / (closes[idx - 3] || 1);
         const momentum_12_period = (currentClose - closes[idx - 12]) / (closes[idx - 12] || 1);
 
-        const closeSlice20 = closes.slice(-20);
+        const closeSlice20 = closes.slice(idx - 19, idx + 1);
         const meanClose20 = closeSlice20.reduce((a, b) => a + b, 0) / 20;
         const stdDevClose20 = calcStdDev(closeSlice20, meanClose20);
         const bb_position = (currentClose - meanClose20) / stdDevClose20;
@@ -271,23 +292,31 @@ async function runExecutionCycle(session) {
         }
         const directional_persistence = dirPersist / 5;
 
-        const macroEmaFast = calculateEMAArray(closes, settings.macro_ema_fast).pop();
-        const macroEmaSlow = calculateEMAArray(closes, settings.macro_ema_slow).pop();
+        const macroEmaFast = calculateEMAArray(closeSliceRSI, settings.macro_ema_fast).pop();
+        const macroEmaSlow = calculateEMAArray(closeSliceRSI, settings.macro_ema_slow).pop();
         const dist_from_macro_fast = (currentClose - macroEmaFast) / macroEmaFast;
         const dist_from_macro_slow = (currentClose - macroEmaSlow) / macroEmaSlow;
+
+        // 🛡️ SHIELD 3: MACRO EXTENSION VETO (HARD CEILING)
+        if (dist_from_macro_fast > 0.025) {
+            const shieldMsg = `shield active: overextended momentum spike detected. distance from macro fast (${dist_from_macro_fast.toFixed(4)}) exceeds 2.5% ceiling.`;
+            logCyan(shieldMsg);
+            await transmitTelemetry(0, 'shield_skip', shieldMsg);
+            return;
+        }
 
         let market_regime = 0; 
         if (currentClose > macroEmaFast && macroEmaFast > macroEmaSlow) market_regime = 1; 
         else if (currentClose < macroEmaFast && macroEmaFast < macroEmaSlow) market_regime = -1;
 
-        const ema12Array = calculateEMAArray(closes, 12);
-        const ema26Array = calculateEMAArray(closes, 26);
+        const ema12Array = calculateEMAArray(closeSliceRSI, 12);
+        const ema26Array = calculateEMAArray(closeSliceRSI, 26);
         const macdLine = [];
-        const startIdx12 = closes.length - ema12Array.length;
-        const startIdx26 = closes.length - ema26Array.length;
-        for (let j = 0; j < closes.length; j++) {
-            const val12 = j >= startIdx12 ? ema12Array[j - startIdx12] : closes[j];
-            const val26 = j >= startIdx26 ? ema26Array[j - startIdx26] : closes[j];
+        const startIdx12 = closeSliceRSI.length - ema12Array.length;
+        const startIdx26 = closeSliceRSI.length - ema26Array.length;
+        for (let j = 0; j < closeSliceRSI.length; j++) {
+            const val12 = j >= startIdx12 ? ema12Array[j - startIdx12] : closeSliceRSI[j];
+            const val26 = j >= startIdx26 ? ema26Array[j - startIdx26] : closeSliceRSI[j];
             macdLine.push(val12 - val26);
         }
         const signalLine = calculateEMAArray(macdLine, 9);
@@ -297,7 +326,7 @@ async function runExecutionCycle(session) {
         const macd_hist = currentHist / (currentClose || 1);
 
         let colorFlips = 0;
-        for (let j = closes.length - 1; j >= closes.length - 4; j--) {
+        for (let j = idx; j >= idx - 3; j--) {
             const currentColor = closes[j] >= opens[j] ? 'green' : 'red';
             const prevColor = closes[j-1] >= opens[j-1] ? 'green' : 'red';
             if (currentColor !== prevColor) colorFlips++;
@@ -343,7 +372,6 @@ async function runExecutionCycle(session) {
             logCyan(`>>> ${msg}`);
             await transmitTelemetry(rawModelScore, 'execute', msg);
             
-            // log the position initialization into our supabase state engine
             const { error: posError } = await supabase.from('neptune_positions').insert([{
                 ticker: TICKER,
                 entry_price: currentClose,
@@ -381,11 +409,17 @@ async function bootNeptune() {
         const session = await ort.InferenceSession.create(MODEL_FILENAME);
         
         await runExecutionCycle(session);
-        setInterval(() => runExecutionCycle(session), 15 * 60 * 1000);
-        logCyan('listening for market horizons...');
+        
+        // --- PRECISION CRON SCHEDULER: SNAPS TO 00, 15, 30, 45 ---
+        cron.schedule('0,15,30,45 * * * *', () => {
+            runExecutionCycle(session);
+        });
+        
+        logCyan('listening for strict 15m market horizons...');
     } catch (err) {
         logCyan(`❌ fatal initialization error: ${err.message}`);
     }
 }
 
 bootNeptune();
+                                                         
